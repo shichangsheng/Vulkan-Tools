@@ -40,7 +40,9 @@
 #endif
 
 #ifdef _WIN32
+#ifdef _MSC_VER
 #pragma comment(linker, "/subsystem:windows")
+#endif  // MSVC
 #define APP_NAME_STR_LEN 80
 #endif  // _WIN32
 
@@ -327,6 +329,10 @@ struct demo {
     struct wl_seat *seat;
     struct wl_pointer *pointer;
     struct wl_keyboard *keyboard;
+#elif defined(VK_USE_PLATFORM_DIRECTFB_EXT)
+    IDirectFB *dfb;
+    IDirectFBSurface *window;
+    IDirectFBEventBuffer *event_buffer;
 #elif defined(VK_USE_PLATFORM_ANDROID_KHR)
     struct ANativeWindow *window;
 #elif defined(VK_USE_PLATFORM_METAL_EXT)
@@ -337,6 +343,7 @@ struct demo {
     bool use_staging_buffer;
     bool separate_present_queue;
     bool is_minimized;
+    int32_t gpu_number;
 
     bool VK_KHR_incremental_present_enabled;
 
@@ -1357,10 +1364,10 @@ static void demo_prepare_buffers(struct demo *demo) {
             .format = demo->format,
             .components =
                 {
-                    .r = VK_COMPONENT_SWIZZLE_R,
-                    .g = VK_COMPONENT_SWIZZLE_G,
-                    .b = VK_COMPONENT_SWIZZLE_B,
-                    .a = VK_COMPONENT_SWIZZLE_A,
+                    .r = VK_COMPONENT_SWIZZLE_IDENTITY,
+                    .g = VK_COMPONENT_SWIZZLE_IDENTITY,
+                    .b = VK_COMPONENT_SWIZZLE_IDENTITY,
+                    .a = VK_COMPONENT_SWIZZLE_IDENTITY,
                 },
             .subresourceRange =
                 {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1},
@@ -1722,10 +1729,10 @@ static void demo_prepare_textures(struct demo *demo) {
             .format = tex_format,
             .components =
                 {
-                    VK_COMPONENT_SWIZZLE_R,
-                    VK_COMPONENT_SWIZZLE_G,
-                    VK_COMPONENT_SWIZZLE_B,
-                    VK_COMPONENT_SWIZZLE_A,
+                    VK_COMPONENT_SWIZZLE_IDENTITY,
+                    VK_COMPONENT_SWIZZLE_IDENTITY,
+                    VK_COMPONENT_SWIZZLE_IDENTITY,
+                    VK_COMPONENT_SWIZZLE_IDENTITY,
                 },
             .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
             .flags = 0,
@@ -1974,6 +1981,8 @@ static void demo_prepare_fs(struct demo *demo) {
 }
 
 static void demo_prepare_pipeline(struct demo *demo) {
+#define NUM_DYNAMIC_STATES 2 /*Viewport + Scissor*/
+
     VkGraphicsPipelineCreateInfo pipeline;
     VkPipelineCacheCreateInfo pipelineCache;
     VkPipelineVertexInputStateCreateInfo vi;
@@ -1983,7 +1992,7 @@ static void demo_prepare_pipeline(struct demo *demo) {
     VkPipelineDepthStencilStateCreateInfo ds;
     VkPipelineViewportStateCreateInfo vp;
     VkPipelineMultisampleStateCreateInfo ms;
-    VkDynamicState dynamicStateEnables[VK_DYNAMIC_STATE_RANGE_SIZE];
+    VkDynamicState dynamicStateEnables[NUM_DYNAMIC_STATES];
     VkPipelineDynamicStateCreateInfo dynamicState;
     VkResult U_ASSERT_ONLY err;
 
@@ -2364,6 +2373,10 @@ static void demo_cleanup(struct demo *demo) {
     wl_compositor_destroy(demo->compositor);
     wl_registry_destroy(demo->registry);
     wl_display_disconnect(demo->display);
+#elif defined(VK_USE_PLATFORM_DIRECTFB_EXT)
+    demo->event_buffer->Release(demo->event_buffer);
+    demo->window->Release(demo->window);
+    demo->dfb->Release(demo->dfb);
 #endif
 
     vkDestroyInstance(demo->inst, NULL);
@@ -2766,6 +2779,80 @@ static void demo_create_window(struct demo *demo) {
     wl_shell_surface_set_toplevel(demo->shell_surface);
     wl_shell_surface_set_title(demo->shell_surface, APP_SHORT_NAME);
 }
+#elif defined(VK_USE_PLATFORM_DIRECTFB_EXT)
+static void demo_create_directfb_window(struct demo *demo) {
+    DFBResult ret;
+
+    ret = DirectFBInit(NULL, NULL);
+    if (ret) {
+        printf("DirectFBInit failed to initialize DirectFB!\n");
+        fflush(stdout);
+        exit(1);
+    }
+
+    ret = DirectFBCreate(&demo->dfb);
+    if (ret) {
+        printf("DirectFBCreate failed to create main interface of DirectFB!\n");
+        fflush(stdout);
+        exit(1);
+    }
+
+    DFBSurfaceDescription desc;
+    desc.flags = DSDESC_CAPS | DSDESC_WIDTH | DSDESC_HEIGHT;
+    desc.caps = DSCAPS_PRIMARY;
+    desc.width = demo->width;
+    desc.height = demo->height;
+    ret = demo->dfb->CreateSurface(demo->dfb, &desc, &demo->window);
+    if (ret) {
+        printf("CreateSurface failed to create DirectFB surface interface!\n");
+        fflush(stdout);
+        exit(1);
+    }
+
+    ret = demo->dfb->CreateInputEventBuffer(demo->dfb, DICAPS_KEYS, DFB_FALSE, &demo->event_buffer);
+    if (ret) {
+        printf("CreateInputEventBuffer failed to create DirectFB event buffer interface!\n");
+        fflush(stdout);
+        exit(1);
+    }
+}
+
+static void demo_handle_directfb_event(struct demo *demo, const DFBInputEvent *event) {
+    if (event->type != DIET_KEYPRESS) return;
+    switch (event->key_symbol) {
+        case DIKS_ESCAPE:  // Escape
+            demo->quit = true;
+            break;
+        case DIKS_CURSOR_LEFT:  // left arrow key
+            demo->spin_angle -= demo->spin_increment;
+            break;
+        case DIKS_CURSOR_RIGHT:  // right arrow key
+            demo->spin_angle += demo->spin_increment;
+            break;
+        case DIKS_SPACE:  // space bar
+            demo->pause = !demo->pause;
+            break;
+        default:
+            break;
+    }
+}
+
+static void demo_run_directfb(struct demo *demo) {
+    while (!demo->quit) {
+        DFBInputEvent event;
+
+        if (demo->pause) {
+            demo->event_buffer->WaitForEvent(demo->event_buffer);
+            if (!demo->event_buffer->GetEvent(demo->event_buffer, DFB_EVENT(&event))) demo_handle_directfb_event(demo, &event);
+        } else {
+            if (!demo->event_buffer->GetEvent(demo->event_buffer, DFB_EVENT(&event))) demo_handle_directfb_event(demo, &event);
+
+            demo_draw(demo);
+            demo->curFrame++;
+            if (demo->frameCount != INT32_MAX && demo->curFrame == demo->frameCount) demo->quit = true;
+        }
+    }
+}
 #elif defined(VK_USE_PLATFORM_ANDROID_KHR)
 static void demo_run(struct demo *demo) {
     if (!demo->prepared) return;
@@ -2797,15 +2884,6 @@ static VkResult demo_create_display_surface(struct demo *demo) {
     VkDisplaySurfaceCreateInfoKHR create_info;
 
     // Get the first display
-    err = vkGetPhysicalDeviceDisplayPropertiesKHR(demo->gpu, &display_count, NULL);
-    assert(!err);
-
-    if (display_count == 0) {
-        printf("Cannot find any display!\n");
-        fflush(stdout);
-        exit(1);
-    }
-
     display_count = 1;
     err = vkGetPhysicalDeviceDisplayPropertiesKHR(demo->gpu, &display_count, &display_props);
     assert(!err || (err == VK_INCOMPLETE));
@@ -2952,7 +3030,30 @@ static VkBool32 demo_check_layers(uint32_t check_count, char **check_names, uint
     }
     return 1;
 }
-
+#if defined(VK_USE_PLATFORM_DISPLAY_KHR)
+int find_display_gpu(int gpu_number, uint32_t gpu_count, VkPhysicalDevice *physical_devices) {
+    uint32_t display_count = 0;
+    VkResult result;
+    int gpu_return = gpu_number;
+    if (gpu_number >= 0) {
+        result = vkGetPhysicalDeviceDisplayPropertiesKHR(physical_devices[gpu_number], &display_count, NULL);
+        assert(!result);
+    } else {
+        for (uint32_t i = 0; i < gpu_count; i++) {
+            result = vkGetPhysicalDeviceDisplayPropertiesKHR(physical_devices[i], &display_count, NULL);
+            assert(!result);
+            if (display_count) {
+                gpu_return = i;
+                break;
+            }
+        }
+    }
+    if (display_count > 0)
+        return gpu_return;
+    else
+        return -1;
+}
+#endif
 static void demo_init_vk(struct demo *demo) {
     VkResult err;
     uint32_t instance_extension_count = 0;
@@ -3028,6 +3129,11 @@ static void demo_init_vk(struct demo *demo) {
                 platformSurfaceExtFound = 1;
                 demo->extension_names[demo->enabled_extension_count++] = VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME;
             }
+#elif defined(VK_USE_PLATFORM_DIRECTFB_EXT)
+            if (!strcmp(VK_EXT_DIRECTFB_SURFACE_EXTENSION_NAME, instance_extensions[i].extensionName)) {
+                platformSurfaceExtFound = 1;
+                demo->extension_names[demo->enabled_extension_count++] = VK_EXT_DIRECTFB_SURFACE_EXTENSION_NAME;
+            }
 #elif defined(VK_USE_PLATFORM_DISPLAY_KHR)
             if (!strcmp(VK_KHR_DISPLAY_EXTENSION_NAME, instance_extensions[i].extensionName)) {
                 platformSurfaceExtFound = 1;
@@ -3044,6 +3150,9 @@ static void demo_init_vk(struct demo *demo) {
                 demo->extension_names[demo->enabled_extension_count++] = VK_EXT_METAL_SURFACE_EXTENSION_NAME;
             }
 #endif
+            if (!strcmp(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME, instance_extensions[i].extensionName)) {
+                demo->extension_names[demo->enabled_extension_count++] = VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME;
+            }
             if (!strcmp(VK_EXT_DEBUG_UTILS_EXTENSION_NAME, instance_extensions[i].extensionName)) {
                 if (demo->validate) {
                     demo->extension_names[demo->enabled_extension_count++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
@@ -3105,6 +3214,12 @@ static void demo_init_vk(struct demo *demo) {
                  "Do you have a compatible Vulkan installable client driver (ICD) installed?\n"
                  "Please look at the Getting Started guide for additional information.\n",
                  "vkCreateInstance Failure");
+#elif defined(VK_USE_PLATFORM_DIRECTFB_EXT)
+        ERR_EXIT("vkEnumerateInstanceExtensionProperties failed to find the " VK_EXT_DIRECTFB_SURFACE_EXTENSION_NAME
+                 " extension.\n\n"
+                 "Do you have a compatible Vulkan installable client driver (ICD) installed?\n"
+                 "Please look at the Getting Started guide for additional information.\n",
+                 "vkCreateInstance Failure");
 #endif
     }
     const VkApplicationInfo app = {
@@ -3147,8 +3262,6 @@ static void demo_init_vk(struct demo *demo) {
         inst_info.pNext = &dbg_messenger_create_info;
     }
 
-    uint32_t gpu_count;
-
     err = vkCreateInstance(&inst_info, NULL, &demo->inst);
     if (err == VK_ERROR_INCOMPATIBLE_DRIVER) {
         ERR_EXIT(
@@ -3168,24 +3281,78 @@ static void demo_init_vk(struct demo *demo) {
             "vkCreateInstance Failure");
     }
 
-    /* Make initial call to query gpu_count, then second call for gpu info*/
+    /* Make initial call to query gpu_count, then second call for gpu info */
+    uint32_t gpu_count = 0;
     err = vkEnumeratePhysicalDevices(demo->inst, &gpu_count, NULL);
     assert(!err);
 
-    if (gpu_count > 0) {
-        VkPhysicalDevice *physical_devices = malloc(sizeof(VkPhysicalDevice) * gpu_count);
-        err = vkEnumeratePhysicalDevices(demo->inst, &gpu_count, physical_devices);
-        assert(!err);
-        /* For cube demo we just grab the first physical device */
-        demo->gpu = physical_devices[0];
-        free(physical_devices);
-    } else {
+    if (gpu_count <= 0) {
         ERR_EXIT(
             "vkEnumeratePhysicalDevices reported zero accessible devices.\n\n"
             "Do you have a compatible Vulkan installable client driver (ICD) installed?\n"
             "Please look at the Getting Started guide for additional information.\n",
             "vkEnumeratePhysicalDevices Failure");
     }
+
+    VkPhysicalDevice *physical_devices = malloc(sizeof(VkPhysicalDevice) * gpu_count);
+    err = vkEnumeratePhysicalDevices(demo->inst, &gpu_count, physical_devices);
+    assert(!err);
+    if (demo->gpu_number >= 0 && !((uint32_t)demo->gpu_number < gpu_count)) {
+        fprintf(stderr, "GPU %d specified is not present, GPU count = %u\n", demo->gpu_number, gpu_count);
+        ERR_EXIT("Specified GPU number is not present", "User Error");
+    }
+
+#if defined(VK_USE_PLATFORM_DISPLAY_KHR)
+    demo->gpu_number = find_display_gpu(demo->gpu_number, gpu_count, physical_devices);
+    if (demo->gpu_number < 0) {
+        printf("Cannot find any display!\n");
+        fflush(stdout);
+        exit(1);
+    }
+#else
+    /* Try to auto select most suitable device */
+    if (demo->gpu_number == -1) {
+        uint32_t count_device_type[VK_PHYSICAL_DEVICE_TYPE_CPU + 1];
+        memset(count_device_type, 0, sizeof(count_device_type));
+
+        VkPhysicalDeviceProperties physicalDeviceProperties;
+        for (uint32_t i = 0; i < gpu_count; i++) {
+            vkGetPhysicalDeviceProperties(physical_devices[i], &physicalDeviceProperties);
+            assert(physicalDeviceProperties.deviceType <= VK_PHYSICAL_DEVICE_TYPE_CPU);
+            count_device_type[physicalDeviceProperties.deviceType]++;
+        }
+
+        VkPhysicalDeviceType search_for_device_type = VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+        if (count_device_type[VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU]) {
+            search_for_device_type = VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+        } else if (count_device_type[VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU]) {
+            search_for_device_type = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+        } else if (count_device_type[VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU]) {
+            search_for_device_type = VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU;
+        } else if (count_device_type[VK_PHYSICAL_DEVICE_TYPE_CPU]) {
+            search_for_device_type = VK_PHYSICAL_DEVICE_TYPE_CPU;
+        } else if (count_device_type[VK_PHYSICAL_DEVICE_TYPE_OTHER]) {
+            search_for_device_type = VK_PHYSICAL_DEVICE_TYPE_OTHER;
+        }
+
+        for (uint32_t i = 0; i < gpu_count; i++) {
+            vkGetPhysicalDeviceProperties(physical_devices[i], &physicalDeviceProperties);
+            if (physicalDeviceProperties.deviceType == search_for_device_type) {
+                demo->gpu_number = i;
+                break;
+            }
+        }
+    }
+#endif
+    assert(demo->gpu_number >= 0);
+    demo->gpu = physical_devices[demo->gpu_number];
+    {
+        VkPhysicalDeviceProperties physicalDeviceProperties;
+        vkGetPhysicalDeviceProperties(demo->gpu, &physicalDeviceProperties);
+        fprintf(stderr, "Selected GPU %d: %s, type: %u\n", demo->gpu_number, physicalDeviceProperties.deviceName,
+                physicalDeviceProperties.deviceType);
+    }
+    free(physical_devices);
 
     /* Look for device extensions */
     uint32_t device_extension_count = 0;
@@ -3205,6 +3372,9 @@ static void demo_init_vk(struct demo *demo) {
             if (!strcmp(VK_KHR_SWAPCHAIN_EXTENSION_NAME, device_extensions[i].extensionName)) {
                 swapchainExtFound = 1;
                 demo->extension_names[demo->enabled_extension_count++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+            }
+            if (!strcmp("VK_KHR_portability_subset", device_extensions[i].extensionName)) {
+                demo->extension_names[demo->enabled_extension_count++] = "VK_KHR_portability_subset";
             }
             assert(demo->enabled_extension_count < 64);
         }
@@ -3398,6 +3568,15 @@ static void demo_create_surface(struct demo *demo) {
     createInfo.window = demo->xcb_window;
 
     err = vkCreateXcbSurfaceKHR(demo->inst, &createInfo, NULL, &demo->surface);
+#elif defined(VK_USE_PLATFORM_DIRECTFB_EXT)
+    VkDirectFBSurfaceCreateInfoEXT createInfo;
+    createInfo.sType = VK_STRUCTURE_TYPE_DIRECTFB_SURFACE_CREATE_INFO_EXT;
+    createInfo.pNext = NULL;
+    createInfo.flags = 0;
+    createInfo.dfb = demo->dfb;
+    createInfo.surface = demo->window;
+
+    err = vkCreateDirectFBSurfaceEXT(demo->inst, &createInfo, NULL, &demo->surface);
 #elif defined(VK_USE_PLATFORM_DISPLAY_KHR)
     err = demo_create_display_surface(demo);
 #elif defined(VK_USE_PLATFORM_METAL_EXT)
@@ -3699,6 +3878,10 @@ static void demo_init(struct demo *demo, int argc, char **argv) {
     memset(demo, 0, sizeof(*demo));
     demo->presentMode = VK_PRESENT_MODE_FIFO_KHR;
     demo->frameCount = INT32_MAX;
+    /* Autodetect suitable / best GPU by default */
+    demo->gpu_number = -1;
+    demo->width = 500;
+    demo->height = 500;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--use_staging") == 0) {
@@ -3732,6 +3915,14 @@ static void demo_init(struct demo *demo, int argc, char **argv) {
             i++;
             continue;
         }
+        if (strcmp(argv[i], "--width") == 0 && i < argc - 1 && sscanf(argv[i + 1], "%d", &demo->width) == 1 && demo->width > 0) {
+            i++;
+            continue;
+        }
+        if (strcmp(argv[i], "--height") == 0 && i < argc - 1 && sscanf(argv[i + 1], "%d", &demo->height) == 1 && demo->height > 0) {
+            i++;
+            continue;
+        }
         if (strcmp(argv[i], "--suppress_popups") == 0) {
             demo->suppress_popups = true;
             continue;
@@ -3744,6 +3935,12 @@ static void demo_init(struct demo *demo, int argc, char **argv) {
             demo->VK_KHR_incremental_present_enabled = true;
             continue;
         }
+        if ((strcmp(argv[i], "--gpu_number") == 0) && (i < argc - 1)) {
+            demo->gpu_number = atoi(argv[i + 1]);
+            assert(demo->gpu_number >= 0);
+            i++;
+            continue;
+        }
 
 #if defined(ANDROID)
         ERR_EXIT("Usage: vkcube [--validate]\n", "Usage");
@@ -3752,7 +3949,9 @@ static void demo_init(struct demo *demo, int argc, char **argv) {
             "Usage:\n  %s\t[--use_staging] [--validate] [--validate-checks-disabled]\n"
             "\t[--break] [--c <framecount>] [--suppress_popups]\n"
             "\t[--incremental_present] [--display_timing]\n"
+            "\t[--gpu_number <index of physical device>]\n"
             "\t[--present_mode <present mode enum>]\n"
+            "\t[--width <width>] [--height <height>]\n"
             "\t<present_mode_enum>\n"
             "\t\tVK_PRESENT_MODE_IMMEDIATE_KHR = %d\n"
             "\t\tVK_PRESENT_MODE_MAILBOX_KHR = %d\n"
@@ -3780,9 +3979,6 @@ static void demo_init(struct demo *demo, int argc, char **argv) {
     demo_init_connection(demo);
 
     demo_init_vk(demo);
-
-    demo->width = 500;
-    demo->height = 500;
 
     demo->spin_angle = 4.0f;
     demo->spin_increment = 0.2f;
@@ -3999,6 +4195,8 @@ int main(int argc, char **argv) {
     demo_create_xlib_window(&demo);
 #elif defined(VK_USE_PLATFORM_WAYLAND_KHR)
     demo_create_window(&demo);
+#elif defined(VK_USE_PLATFORM_DIRECTFB_EXT)
+    demo_create_directfb_window(&demo);
 #endif
 
     demo_init_vk_swapchain(&demo);
@@ -4011,6 +4209,8 @@ int main(int argc, char **argv) {
     demo_run_xlib(&demo);
 #elif defined(VK_USE_PLATFORM_WAYLAND_KHR)
     demo_run(&demo);
+#elif defined(VK_USE_PLATFORM_DIRECTFB_EXT)
+    demo_run_directfb(&demo);
 #elif defined(VK_USE_PLATFORM_DISPLAY_KHR)
     demo_run_display(&demo);
 #endif

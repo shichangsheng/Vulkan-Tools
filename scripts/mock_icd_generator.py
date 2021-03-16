@@ -54,18 +54,22 @@ static void DestroyDispObjHandle(void* handle) {
 SOURCE_CPP_PREFIX = '''
 using std::unordered_map;
 
+static constexpr uint32_t icd_physical_device_count = 1;
+static constexpr uint32_t kSupportedVulkanAPIVersion = VK_API_VERSION_1_1;
+static unordered_map<VkInstance, std::array<VkPhysicalDevice, icd_physical_device_count>> physical_device_map;
+
 // Map device memory handle to any mapped allocations that we'll need to free on unmap
 static unordered_map<VkDeviceMemory, std::vector<void*>> mapped_memory_map;
 
 // Map device memory allocation handle to the size
 static unordered_map<VkDeviceMemory, VkDeviceSize> allocated_memory_size_map;
 
-static VkPhysicalDevice physical_device = (VkPhysicalDevice)CreateDispObjHandle();
 static unordered_map<VkDevice, unordered_map<uint32_t, unordered_map<uint32_t, VkQueue>>> queue_map;
 static unordered_map<VkDevice, unordered_map<VkBuffer, VkBufferCreateInfo>> buffer_map;
+static unordered_map<VkDevice, unordered_map<VkImage, VkDeviceSize>> image_memory_size_map;
 
 static constexpr uint32_t icd_swapchain_image_count = 1;
-static std::unordered_map<VkSwapchainKHR, VkImage[icd_swapchain_image_count]> swapchain_image_map;
+static unordered_map<VkSwapchainKHR, VkImage[icd_swapchain_image_count]> swapchain_image_map;
 
 // TODO: Would like to codegen this but limits aren't in XML
 static VkPhysicalDeviceLimits SetLimits(VkPhysicalDeviceLimits *limits) {
@@ -427,19 +431,30 @@ CUSTOM_C_INTERCEPTS = {
         return VK_ERROR_INCOMPATIBLE_DRIVER;
     }
     *pInstance = (VkInstance)CreateDispObjHandle();
+    for (auto& physical_device : physical_device_map[*pInstance])
+        physical_device = (VkPhysicalDevice)CreateDispObjHandle();
     // TODO: If emulating specific device caps, will need to add intelligence here
     return VK_SUCCESS;
 ''',
 'vkDestroyInstance': '''
-    DestroyDispObjHandle((void*)instance);
+    if (instance) {
+        for (const auto physical_device : physical_device_map.at(instance))
+            DestroyDispObjHandle((void*)physical_device);
+        physical_device_map.erase(instance);
+        DestroyDispObjHandle((void*)instance);
+    }
 ''',
 'vkEnumeratePhysicalDevices': '''
+    VkResult result_code = VK_SUCCESS;
     if (pPhysicalDevices) {
-        *pPhysicalDevices = physical_device;
+        const auto return_count = (std::min)(*pPhysicalDeviceCount, icd_physical_device_count);
+        for (uint32_t i = 0; i < return_count; ++i) pPhysicalDevices[i] = physical_device_map.at(instance)[i];
+        if (return_count < icd_physical_device_count) result_code = VK_INCOMPLETE;
+        *pPhysicalDeviceCount = return_count;
     } else {
-        *pPhysicalDeviceCount = 1;
+        *pPhysicalDeviceCount = icd_physical_device_count;
     }
-    return VK_SUCCESS;
+    return result_code;
 ''',
 'vkCreateDevice': '''
     *pDevice = (VkDevice)CreateDispObjHandle();
@@ -458,6 +473,8 @@ CUSTOM_C_INTERCEPTS = {
         }
     }
     queue_map.clear();
+    buffer_map.erase(device);
+    image_memory_size_map.erase(device);
     // Now destroy device
     DestroyDispObjHandle((void*)device);
     // TODO: If emulating specific device caps, will need to add intelligence here
@@ -478,6 +495,10 @@ CUSTOM_C_INTERCEPTS = {
     // TODO: Add further support for GetDeviceQueue2 features
 ''',
 'vkEnumerateInstanceLayerProperties': '''
+    return VK_SUCCESS;
+''',
+'vkEnumerateInstanceVersion': '''
+    *pApiVersion = kSupportedVulkanAPIVersion;
     return VK_SUCCESS;
 ''',
 'vkEnumerateDeviceLayerProperties': '''
@@ -613,8 +634,8 @@ CUSTOM_C_INTERCEPTS = {
     pSurfaceCapabilities->currentExtent.height = 0xFFFFFFFF;
     pSurfaceCapabilities->minImageExtent.width = 1;
     pSurfaceCapabilities->minImageExtent.height = 1;
-    pSurfaceCapabilities->maxImageExtent.width = 3840;
-    pSurfaceCapabilities->maxImageExtent.height = 2160;
+    pSurfaceCapabilities->maxImageExtent.width = 0xFFFF;
+    pSurfaceCapabilities->maxImageExtent.height = 0xFFFF;
     pSurfaceCapabilities->maxImageArrayLayers = 128;
     pSurfaceCapabilities->supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR |
                                                 VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR |
@@ -749,7 +770,7 @@ CUSTOM_C_INTERCEPTS = {
 ''',
 'vkGetPhysicalDeviceProperties': '''
     // TODO: Just hard-coding some values for now
-    pProperties->apiVersion = VK_API_VERSION_1_0;
+    pProperties->apiVersion = kSupportedVulkanAPIVersion;
     pProperties->driverVersion = 1;
     pProperties->vendorID = 0xba5eba11;
     pProperties->deviceID = 0xf005ba11;
@@ -848,10 +869,16 @@ CUSTOM_C_INTERCEPTS = {
     GetBufferMemoryRequirements(device, pInfo->buffer, &pMemoryRequirements->memoryRequirements);
 ''',
 'vkGetImageMemoryRequirements': '''
-    // TODO: Just hard-coding reqs for now
-    pMemoryRequirements->size = 4096;
+    pMemoryRequirements->size = 0;
     pMemoryRequirements->alignment = 1;
 
+    auto d_iter = image_memory_size_map.find(device);
+    if(d_iter != image_memory_size_map.end()){
+        auto iter = d_iter->second.find(image);
+        if (iter != d_iter->second.end()) {
+            pMemoryRequirements->size = iter->second;
+        }
+    }
     // Here we hard-code that the memory type at index 3 doesn't support this image.
     pMemoryRequirements->memoryTypeBits = 0xFFFF & ~(0x1 << 3);
 ''',
@@ -926,6 +953,47 @@ CUSTOM_C_INTERCEPTS = {
     unique_lock_t lock(global_lock);
     buffer_map[device].erase(buffer);
 ''',
+'vkCreateImage': '''
+    unique_lock_t lock(global_lock);
+    *pImage = (VkImage)global_unique_handle++;
+    // TODO: A pixel size is 32 bytes. This accounts for the largest possible pixel size of any format. It could be changed to more accurate size if need be.
+    image_memory_size_map[device][*pImage] = pCreateInfo->extent.width * pCreateInfo->extent.height * pCreateInfo->extent.depth *
+                                             32 * pCreateInfo->arrayLayers * (pCreateInfo->mipLevels > 1 ? 2 : 1);
+    // plane count
+    switch (pCreateInfo->format) {
+        case VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM:
+        case VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM:
+        case VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM:
+        case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16:
+        case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16:
+        case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16:
+        case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_420_UNORM_3PACK16:
+        case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16:
+        case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16:
+        case VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM:
+        case VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM:
+        case VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM:
+            image_memory_size_map[device][*pImage] *= 3;
+            break;
+        case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:
+        case VK_FORMAT_G8_B8R8_2PLANE_422_UNORM:
+        case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:
+        case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16:
+        case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16:
+        case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16:
+        case VK_FORMAT_G16_B16R16_2PLANE_420_UNORM:
+        case VK_FORMAT_G16_B16R16_2PLANE_422_UNORM:
+            image_memory_size_map[device][*pImage] *= 2;
+            break;
+        default:
+            break;
+    }
+    return VK_SUCCESS;
+''',
+'vkDestroyImage': '''
+    unique_lock_t lock(global_lock);
+    image_memory_size_map[device].erase(image);
+''',
 }
 
 # MockICDGeneratorOptions - subclass of GeneratorOptions.
@@ -966,6 +1034,7 @@ class MockICDGeneratorOptions(GeneratorOptions):
                  conventions = None,
                  filename = None,
                  directory = '.',
+                 genpath = None,
                  apiname = None,
                  profile = None,
                  versions = '.*',
@@ -989,9 +1058,20 @@ class MockICDGeneratorOptions(GeneratorOptions):
                  alignFuncParam = 0,
                  expandEnumerants = True,
                  helper_file_type = ''):
-        GeneratorOptions.__init__(self, conventions, filename, directory, apiname, profile,
-                                  versions, emitversions, defaultExtensions,
-                                  addExtensions, removeExtensions, emitExtensions, sortProcedure)
+        GeneratorOptions.__init__(self,
+                 conventions = conventions,
+                 filename = filename,
+                 directory = directory,
+                 genpath = genpath,
+                 apiname = apiname,
+                 profile = profile,
+                 versions = versions,
+                 emitversions = emitversions,
+                 defaultExtensions = defaultExtensions,
+                 addExtensions = addExtensions,
+                 removeExtensions = removeExtensions,
+                 emitExtensions = emitExtensions,
+                 sortProcedure = sortProcedure)
         self.prefixText      = prefixText
         self.genFuncPointers = genFuncPointers
         self.protectFile     = protectFile
@@ -1093,6 +1173,7 @@ class MockICDOutputGenerator(OutputGenerator):
             write('#include "mock_icd.h"', file=self.outFile)
             write('#include <stdlib.h>', file=self.outFile)
             write('#include <algorithm>', file=self.outFile)
+            write('#include <array>', file=self.outFile)
             write('#include <vector>', file=self.outFile)
             write('#include "vk_typemap_helper.h"', file=self.outFile)
 
@@ -1104,7 +1185,7 @@ class MockICDOutputGenerator(OutputGenerator):
             device_exts = []
             instance_exts = []
             # Ignore extensions that ICDs should not implement or are not safe to report
-            ignore_exts = ['VK_EXT_validation_cache']
+            ignore_exts = ['VK_EXT_validation_cache', 'VK_KHR_portability_subset']
             for ext in self.registry.tree.findall("extensions/extension"):
                 if ext.attrib['supported'] != 'disabled': # Only include enabled extensions
                     if (ext.attrib['name'] in ignore_exts):
@@ -1238,7 +1319,7 @@ class MockICDOutputGenerator(OutputGenerator):
             return
 
         manual_functions = [
-            # Include functions here to be interecpted w/ manually implemented function bodies
+            # Include functions here to be intercepted w/ manually implemented function bodies
             'vkGetDeviceProcAddr',
             'vkGetInstanceProcAddr',
             'vkCreateDevice',
@@ -1248,6 +1329,7 @@ class MockICDOutputGenerator(OutputGenerator):
             #'vkCreateDebugReportCallbackEXT',
             #'vkDestroyDebugReportCallbackEXT',
             'vkEnumerateInstanceLayerProperties',
+            'vkEnumerateInstanceVersion',
             'vkEnumerateInstanceExtensionProperties',
             'vkEnumerateDeviceLayerProperties',
             'vkEnumerateDeviceExtensionProperties',

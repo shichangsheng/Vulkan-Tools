@@ -66,8 +66,9 @@ std::string VkVersionString(VulkanVersion v) {
 enum class OutputType { text, html, json, vkconfig_output };
 
 class Printer {
-   public:
-    Printer(OutputType output_type, std::ostream &out, const uint32_t selected_gpu, const VulkanVersion vulkan_version)
+  public:
+    Printer(OutputType output_type, std::ostream &out, const uint32_t selected_gpu, const VulkanVersion vulkan_version,
+            std::string start_string = "")
         : output_type(output_type), out(out) {
         switch (output_type) {
             case (OutputType::text):
@@ -75,7 +76,6 @@ class Printer {
                 out << "VULKANINFO\n";
                 out << "==========\n\n";
                 out << "Vulkan Instance Version: " << VkVersionString(vulkan_version) << "\n\n\n";
-
                 break;
             case (OutputType::html):
                 out << "<!doctype html>\n";
@@ -172,20 +172,9 @@ class Printer {
                 indents += 3;
                 break;
             case (OutputType::json):
-                out << "{\n";
-                out << "\t\"$schema\": \"https://schema.khronos.org/vulkan/devsim_1_0_0.json#\",\n";
-                out << "\t\"comments\": {\n";
-                out << "\t\t\"desc\": \"JSON configuration file describing GPU " << selected_gpu
-                    << ". Generated using the vulkaninfo program.\",\n";
-                out << "\t\t\"vulkanApiVersion\": \"" << VkVersionString(vulkan_version) << "\"\n";
-                out << "\t}";
-                indents++;
-                is_first_item.push(false);
-                is_array.push(false);
-                break;
+                /* fall through */
             case (OutputType::vkconfig_output):
-                out << "{\n";
-                out << "\t\"Vulkan Instance Version\": \"" << VkVersionString(vulkan_version) << "\"";
+                out << start_string;
                 indents++;
                 is_first_item.push(false);
                 is_array.push(false);
@@ -268,6 +257,11 @@ class Printer {
         return *this;
     }
 
+    Printer &SetAlwaysOpenDetails(bool value = true) {
+        should_always_open = value;
+        return *this;
+    }
+
     Printer &SetTitleAsType() {
         set_object_name_as_type = true;
         return *this;
@@ -309,7 +303,7 @@ class Printer {
             }
             case (OutputType::html):
                 out << std::string(static_cast<size_t>(indents), '\t');
-                if (set_details_open) {
+                if (set_details_open || should_always_open) {
                     out << "<details open>";
                     set_details_open = false;
                 } else {
@@ -409,7 +403,7 @@ class Printer {
             }
             case (OutputType::html):
                 out << std::string(static_cast<size_t>(indents), '\t');
-                if (set_details_open) {
+                if (set_details_open || should_always_open) {
                     out << "<details open>";
                     set_details_open = false;
                 } else {
@@ -430,6 +424,7 @@ class Printer {
                 }
                 out << std::string(static_cast<size_t>(indents), '\t') << "\"" << array_name << "\": "
                     << "[\n";
+                assert(is_array.top() == false && "Cant start an array object inside another array, must be enclosed in an object");
                 is_first_item.push(true);
                 is_array.push(true);
                 break;
@@ -613,6 +608,10 @@ class Printer {
                     << DecorateAsValue(std::to_string(revision)) << "</summary></details>\n";
                 break;
             case (OutputType::json):
+                ObjectStart("");
+                PrintKeyString("extensionName", ext_name);
+                PrintKeyValue("specVersion", revision);
+                ObjectEnd();
                 break;
             case (OutputType::vkconfig_output):
                 ObjectStart(ext_name);
@@ -654,7 +653,7 @@ class Printer {
             return input;
     }
 
-   protected:
+  protected:
     OutputType output_type;
     std::ostream &out;
     int indents = 0;
@@ -668,6 +667,9 @@ class Printer {
 
     // open <details>
     bool set_details_open = false;
+
+    // always open <details>
+    bool should_always_open = false;
 
     // make object titles the color of types
     bool set_object_name_as_type = false;
@@ -696,7 +698,7 @@ class Printer {
 // always desired, requiring a manual decrease of indention. This wrapper facilitates that while also
 // automatically re-indenting the output to the previous indent level on scope exit.
 class IndentWrapper {
-   public:
+  public:
     IndentWrapper(Printer &p) : p(p) {
         if (p.Type() == OutputType::text) p.IndentDecrease();
     }
@@ -704,29 +706,29 @@ class IndentWrapper {
         if (p.Type() == OutputType::text) p.IndentIncrease();
     }
 
-   private:
+  private:
     Printer &p;
 };
 
 class ObjectWrapper {
-   public:
+  public:
     ObjectWrapper(Printer &p, std::string object_name) : p(p) { p.ObjectStart(object_name); }
     ObjectWrapper(Printer &p, std::string object_name, size_t count_subobjects) : p(p) {
         p.ObjectStart(object_name, static_cast<int32_t>(count_subobjects));
     }
     ~ObjectWrapper() { p.ObjectEnd(); }
 
-   private:
+  private:
     Printer &p;
 };
 
 class ArrayWrapper {
-   public:
+  public:
     ArrayWrapper(Printer &p, std::string array_name, size_t element_count = 0) : p(p) {
         p.ArrayStart(array_name, static_cast<int32_t>(element_count));
     }
     ~ArrayWrapper() { p.ArrayEnd(); }
 
-   private:
+  private:
     Printer &p;
 };
